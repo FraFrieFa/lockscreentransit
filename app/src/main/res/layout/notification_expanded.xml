@@ -1,0 +1,16 @@
+<!-- res/layout/custom_notification_collapsed.xml -->
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="500dp"
+    android:padding="0dp">
+
+    <TextView
+        android:id="@+id/notificationTitleExpanded"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_alignParentTop="true"
+        android:textStyle="normal"
+        android:textSize="11sp"
+        android:background="#00000000"/>
+
+</RelativeLayout>
