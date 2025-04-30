@@ -12,7 +12,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.location.Location
 import android.os.Build
 import android.os.Bundle
@@ -26,6 +29,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.RemoteViews
 import android.widget.TextView
@@ -62,8 +66,12 @@ import com.google.android.gms.location.Priority
 import com.google.gson.JsonParser
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -71,9 +79,12 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.locationtech.proj4j.CRSFactory
 import org.locationtech.proj4j.CoordinateTransformFactory
 import org.locationtech.proj4j.ProjCoordinate
+import java.io.IOException
+import java.net.SocketTimeoutException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import kotlin.math.exp
 
 @Entity(tableName = "stations")
@@ -147,7 +158,7 @@ class MainActivity : ComponentActivity() {
         val allGranted = result.values.all { it }
         if (allGranted) {
             createNotificationChannel()
-            showNotification(this, "No data")
+            NotificationHelper.createAndShowNotification(this, "No data")
         } else {
             Toast.makeText(this, "Permissions must be granted", Toast.LENGTH_SHORT).show()
         }
@@ -165,7 +176,7 @@ class MainActivity : ComponentActivity() {
 
         // Create the notification channel
         createNotificationChannel()
-        showNotification(this,"No data")
+        NotificationHelper.createAndShowNotification(this, "No data")
 
         setContentView(R.layout.activity_main)
 
@@ -194,12 +205,35 @@ class MainActivity : ComponentActivity() {
         val helpButton = findViewById<ImageButton>(R.id.helpButton)
 
         helpButton.setOnClickListener {
+            // Build an HTML string using <b> for bold and <br/> for line breaks
+            val htmlMessage = """
+        <b>Add Stations</b><br/>
+        Tap <b>Add Station</b>, enter part of a stop name, then <b>Search</b>.<br/>
+        Select one of the up-to-5 results and hit <b>Add Station</b> to save it.<br/><br/>
+        
+        <b>Remove Stations</b><br/>
+        In the main list, tap the remove button next to any station to delete it.<br/><br/>
+        
+        <b>Persistent Notification</b><br/>
+        The app runs a foreground service with an ongoing notification.<br/>
+        • Shows up to 4 saved stations.<br/>
+        • Tap the notification to manually refresh.<br/>
+        • If GPS is enabled, the 4 closest stations are displayed.<br/>
+        • Delayed or updated times are highlighted in red.
+    """.trimIndent()
+
+            // Convert HTML to a Spanned
+            val spanned =
+                Html.fromHtml(htmlMessage, Html.FROM_HTML_MODE_LEGACY)
+
+            // Show the AlertDialog with styled text
             AlertDialog.Builder(this)
-                .setTitle("Help")
-                .setMessage("📍 Tap 'Add Station' to add a new stop.\n\nStations nearby (within 1000m) will automatically appear in your notification. If departure times differ from their scheduled time they are marked red.")
+                .setTitle("Help & Features")
+                .setMessage(spanned)
                 .setPositiveButton("Got it") { dialog, _ -> dialog.dismiss() }
                 .show()
         }
+
 
     }
 
@@ -234,6 +268,7 @@ class MainActivity : ComponentActivity() {
             // When a station is clicked, store the selection and enable the Add button
             selectedStation = station
             btnAdd.isEnabled = true
+            println("$station")
         }
         recyclerSearchResults.layoutManager = LinearLayoutManager(this)
         recyclerSearchResults.adapter = searchAdapter
@@ -299,12 +334,15 @@ class MainActivity : ComponentActivity() {
         const val CHANNEL_ID  = "lock_screen_channel"
 
         suspend fun getStationID(query: String): List<Station> {
-
             val url = "https://webapi.vvo-online.de/tr/pointfinder"
-            val jsonPayload = """{"query": "$query", "limit": 4}"""
+            val jsonPayload = """{"query": "$query", "limit": 5}"""
             val requestBody = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType())
             val request = Request.Builder().url(url).post(requestBody).build()
-            val client = OkHttpClient()
+            val client = OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS)
+                .writeTimeout(2, TimeUnit.SECONDS)
+                .readTimeout(2, TimeUnit.SECONDS)
+                .callTimeout(2, TimeUnit.SECONDS).build()
+
             return withContext(Dispatchers.IO) {
                 val response = client.newCall(request).execute()
                 response.use {
@@ -338,27 +376,30 @@ class MainActivity : ComponentActivity() {
             val jsonPayload = """{"stopid": "$id", "limit": 4}"""
             val requestBody = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType())
             val request = Request.Builder().url(url).post(requestBody).build()
-            val client = OkHttpClient()
+            val client = OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS)
+                .writeTimeout(2, TimeUnit.SECONDS)
+                .readTimeout(2, TimeUnit.SECONDS)
+                .callTimeout(2, TimeUnit.SECONDS).build()
             return withContext(Dispatchers.IO) {
-                val response = client.newCall(request).execute()
-                response.use {
-                    if (it.isSuccessful) {
+                withTimeout(2000L) {
+                    val response = client.newCall(request).execute()
+                    response.use {
+                        if (!it.isSuccessful) {
+                            return@withTimeout "Error: ${it.code}"
+                        }
                         val jsonData = JsonParser.parseString(it.body?.string())
                         val departures = jsonData.asJsonObject.get("Departures").asJsonArray
                         val resultBuilder = StringBuilder()
                         for (departure in departures) {
                             val departure_data = departure.asJsonObject
-
                             var time = departure_data.get("ScheduledTime").asString
-
                             var timeChanged = false
-                            if(departure_data.get("RealTime") != null) {
-                                if(departure_data.get("RealTime").asString != time){
+                            if (departure_data.get("RealTime") != null) {
+                                if (departure_data.get("RealTime").asString != time) {
                                     timeChanged = true
                                 }
                                 time = departure_data.get("RealTime").asString
                             }
-
                             val regex = """/Date\((\d+)([+-]\d{4})?\)/""".toRegex()
                             val matchResult = regex.find(time)
                             if (matchResult != null) {
@@ -369,63 +410,29 @@ class MainActivity : ComponentActivity() {
                                 val minutes = totalSeconds / 60
                                 val seconds = totalSeconds % 60
 
-                                if(timeChanged){
-                                    resultBuilder.append("${departure.asJsonObject.get("LineName").asString} ${departure.asJsonObject.get("Direction").asString}: <font color='#FF5722'>${minutes}m${seconds}s</font>, ")
-                                }else{
-                                    resultBuilder.append("${departure.asJsonObject.get("LineName").asString} ${departure.asJsonObject.get("Direction").asString}: ${minutes}m${seconds}s, ")
+                                if (timeChanged) {
+                                    resultBuilder.append(
+                                        "${departure.asJsonObject.get("LineName").asString} ${
+                                            departure.asJsonObject.get(
+                                                "Direction"
+                                            ).asString
+                                        }: <font color='#FF5722'>${minutes}m${seconds}s</font>, "
+                                    )
+                                } else {
+                                    resultBuilder.append(
+                                        "${departure.asJsonObject.get("LineName").asString} ${
+                                            departure.asJsonObject.get(
+                                                "Direction"
+                                            ).asString
+                                        }: ${minutes}m${seconds}s, "
+                                    )
                                 }
                             }
                         }
-                        return@withContext resultBuilder.toString()
-                    } else {
-                        return@withContext "Error: Unsuccessful response"
+                        return@withTimeout resultBuilder.toString()
                     }
                 }
             }
-        }
-
-        fun refreshNotification(context: Context) {
-            val serviceIntent = Intent(context, ForegroundService::class.java)
-            ContextCompat.startForegroundService(context, serviceIntent)
-        }
-
-        fun showNotification(context: Context, content: String) {
-            val spannedText = Html.fromHtml(content, Html.FROM_HTML_MODE_COMPACT)
-            // Intent to handle notification click
-            val intent = Intent(context, NotificationReceiver::class.java).apply {
-                action = ACTION_SHOW_HELLO_WORLD
-            }
-            val pendingIntent: PendingIntent = PendingIntent.getBroadcast(
-                context,
-                0,
-                intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-
-            val isDarkMode = (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
-            val color = if (isDarkMode) Color.WHITE else Color.BLACK
-
-            val collapsedView = RemoteViews(context.packageName, R.layout.notification_collapsed)
-            collapsedView.setTextColor(R.id.notificationTitle, color)
-            collapsedView.setTextViewText(R.id.notificationTitle, spannedText)
-            collapsedView.setOnClickPendingIntent(R.id.notificationTitle, pendingIntent)
-
-            val expandedView = RemoteViews(context.packageName, R.layout.notification_expanded)
-            expandedView.setTextColor(R.id.notificationTitleExpanded, color)
-            expandedView.setTextViewText(R.id.notificationTitleExpanded, spannedText)
-            expandedView.setOnClickPendingIntent(R.id.notificationTitleExpanded, pendingIntent)
-
-            val notification = NotificationCompat.Builder(context, CHANNEL_ID)
-                .setAutoCancel(true)
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setOngoing(true) // Makes it permanent
-                .setCustomContentView(collapsedView)
-                .setCustomBigContentView(expandedView)
-                .build()
-            val notificationManager =
-                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.notify(1, notification)
         }
     }
 
@@ -467,7 +474,8 @@ class NotificationReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
         if(intent?.action == MainActivity.ACTION_SHOW_HELLO_WORLD){
             if(context != null){
-                MainActivity.refreshNotification(context)
+                val serviceIntent = Intent(context, ForegroundService::class.java)
+                ContextCompat.startForegroundService(context, serviceIntent)
             }
         }
     }
@@ -479,41 +487,57 @@ class StationSearchAdapter(
     private val onItemClick: (Station) -> Unit
 ) : RecyclerView.Adapter<StationSearchAdapter.StationViewHolder>() {
 
-    class StationViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+    // track which position is selected
+    private var selectedPosition = RecyclerView.NO_POSITION
+
+    inner class StationViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         val textView: TextView = itemView.findViewById(android.R.id.text1)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): StationViewHolder {
+        // use the “activated” list item so Android gives you a ripple + activated highlight
         val view = LayoutInflater.from(parent.context)
-            .inflate(android.R.layout.simple_list_item_1, parent, false)
+            .inflate(android.R.layout.simple_list_item_activated_1, parent, false)
         return StationViewHolder(view)
     }
 
+    override fun getItemCount(): Int = stations.size
+
     override fun onBindViewHolder(holder: StationViewHolder, position: Int) {
         val station = stations[position]
-        // Display the station name (you could append the id or position if desired)
         holder.textView.text = station.name
-        holder.itemView.setOnClickListener { onItemClick(station) }
-    }
 
-    override fun getItemCount(): Int = stations.size
+        val bgColor = if (position == selectedPosition)
+            holder.itemView.context.getColor(android.R.color.darker_gray)
+        else
+            Color.TRANSPARENT
+        holder.itemView.setBackgroundColor(bgColor)
+
+        holder.itemView.setOnClickListener {
+            // 2) update the selection
+            val previous = selectedPosition
+            selectedPosition = holder.bindingAdapterPosition
+            notifyItemChanged(previous)
+            notifyItemChanged(selectedPosition)
+
+            // 3) callback for your dialog logic
+            onItemClick(station)
+        }
+    }
 }
+
+
 
 
 fun gk4ToWgs84(rightGK: Double, upGK: Double): Pair<Double, Double> {
     val crsFactory = CRSFactory()
-
     // GK zone 4 (EPSG:31468), based on Bessel 1841 ellipsoid
     val gk4 = crsFactory.createFromName("EPSG:31468")
     val wgs84 = crsFactory.createFromName("EPSG:4326")
-
     val transform = CoordinateTransformFactory().createTransform(gk4, wgs84)
-
     val srcCoord = ProjCoordinate(rightGK, upGK)
     val dstCoord = ProjCoordinate()
-
     transform.transform(srcCoord, dstCoord)
-
     return Pair(dstCoord.y, dstCoord.x) // (lat, lon)
 }
 
@@ -521,15 +545,43 @@ fun gk4ToWgs84(rightGK: Double, upGK: Double): Pair<Double, Double> {
 
 class ForegroundService : Service() {
 
+    companion object {
+        private const val NOTIF_ID = 1
+        private const val UPDATE_INTERVAL_MS = 1000L
+        private const val MAX_UPDATES = 5
+        private const val ACCURACY_THRESHOLD = 100f
+    }
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val departureCache = mutableMapOf<String, String>()
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
 
-        // Start foreground with a lightweight notification
-        startForeground(1, createNotification(applicationContext, "Refreshing..."))
+        // 1) Kick off your permanent notification
+        startForeground(
+            NOTIF_ID,
+            NotificationHelper.createNotification(
+                applicationContext,
+                "Loading stations…"
+            )
+        )
 
-        CoroutineScope(Dispatchers.IO).launch {
+        departureCache.clear()
 
-            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(applicationContext)
+        serviceScope.launch {
+            // 2) Load all stations once
+            val stationDao = AppDatabase.getDatabase(applicationContext).stationDao()
+            val allStations = stationDao.getAllStations()
 
+            // 3) Display the first 4 stations immediately
+            var displayed = allStations.take(4)
+            displayStationTimes(displayed)
+
+            // 4) Set up location requests
+            val fusedClient =
+                LocationServices.getFusedLocationProviderClient(applicationContext)
+
+            // Permission guard
             if (ActivityCompat.checkSelfPermission(
                     applicationContext,
                     Manifest.permission.ACCESS_FINE_LOCATION
@@ -539,91 +591,116 @@ class ForegroundService : Service() {
                     Manifest.permission.ACCESS_COARSE_LOCATION
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
-                println("Fail: Location permission not granted")
+                Log.e("ForegroundService", "Location permission not granted")
+                stopForeground(STOP_FOREGROUND_DETACH)
+                stopSelf()
+                return@launch
             }
 
-            val stationDao = AppDatabase.getDatabase(applicationContext).stationDao()
-            val allStations = stationDao.getAllStations()
-
-            val request = LocationRequest.Builder(
+            val req = LocationRequest.Builder(
                 Priority.PRIORITY_HIGH_ACCURACY,
-                1000L
-            ).setMinUpdateIntervalMillis(1000L).build()
+                UPDATE_INTERVAL_MS
+            ).setMinUpdateIntervalMillis(UPDATE_INTERVAL_MS)
+                .build()
 
-            var updateCount = 0
-            val maxUpdates = 10
-            val accuracyThreshold = 100.0f
+            var updates = 0
 
+            // 5) Callback on every location
             val callback = object : LocationCallback() {
-                override fun onLocationResult(locresult: LocationResult) {
-                    val location = locresult.lastLocation
-                    updateCount++
+                override fun onLocationResult(result: LocationResult) {
+                    val loc = result.lastLocation ?: return
+                    updates++
 
-                    if (location != null) {
-                        val acc = location.accuracy
-
-                        if(acc > accuracyThreshold){
-                            createAndShowNotification(applicationContext, "Accuracy: $accuracyThreshold")
+                    // a) Resort & pick top 4
+                    val top4 = allStations
+                        .sortedBy { st ->
+                            Location("").apply {
+                                latitude = st.latitude
+                                longitude = st.longitude
+                            }.distanceTo(loc)
                         }
+                        .take(4)
 
-                        if (acc <= accuracyThreshold || updateCount >= maxUpdates) {
-                            fusedLocationClient.removeLocationUpdates(this)
-                            Log.d("LocationUpdate", "✅ Stopped (acc <= $accuracyThreshold or max updates reached)")
+                    // b) If order changed, re-display
+                    if (top4.map { it.id } != displayed.map { it.id }) {
+                        displayed = top4
+                        serviceScope.launch { displayStationTimes(displayed) }
+                    }
 
-                            CoroutineScope(Dispatchers.IO).launch {
-                                var result = ""
-                                for (station in allStations) {
-                                    val stationLocation = Location("").apply {
-                                        latitude = station.latitude
-                                        longitude = station.longitude
-                                    }
-
-                                    if(location.distanceTo(stationLocation) < 1000){
-                                        result += "<u>${station.name}</u>: " + sendPost(station.id)
-                                    }
-                                }
-                                val currentTimeMillis = System.currentTimeMillis()
-                                val date = Date(currentTimeMillis)
-                                val formatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-                                val formattedTime = formatter.format(date) + " "
-                                withContext(Dispatchers.Main) {
-                                    createAndShowNotification(applicationContext, formattedTime + result)
-                                }
-                            }
-
-                            // 👉 You can now use this location to filter stations, etc.
-                        }
-                    } else {
-                        Log.w("LocationUpdate", "⚠️ Received null location")
+                    // c) Stop if accurate enough or max tries reached
+                    if (loc.accuracy <= ACCURACY_THRESHOLD || updates >= MAX_UPDATES) {
+                        fusedClient.removeLocationUpdates(this)
+                        stopForeground(STOP_FOREGROUND_DETACH)
+                        stopSelf()
                     }
                 }
             }
-            fusedLocationClient.requestLocationUpdates(
-                request,
+
+            fusedClient.requestLocationUpdates(
+                req,
                 callback,
                 Looper.getMainLooper()
             )
         }
 
-        // Optional: auto-stop after some time if refreshNotification doesn't call stop
+        // 6) Safety net: stop the service after ~10 s
         Handler(Looper.getMainLooper()).postDelayed({
             stopForeground(STOP_FOREGROUND_DETACH)
             stopSelf()
-            //createAndShowNotification(applicationContext, "Outdated station info")
-        }, 15_000) // stop after 30 seconds as a safety
+            serviceScope.cancel("Stopped after 10 seconds")
+        }, UPDATE_INTERVAL_MS * MAX_UPDATES * 2)
 
         return START_NOT_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
 
-    fun createAndShowNotification(context: Context, content: String){
-        val notification = createNotification(context, content)
-        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(1, notification)
+
+    private suspend fun displayStationTimes(stations: List<Station>) {
+        if (stations.isEmpty()) {
+            NotificationHelper.createAndShowNotification(
+                applicationContext,
+                "No stations saved"
+            )
+            return
+        }
+
+        // Only fetch the ones we haven’t already cached
+        val toFetch = stations.filter { !departureCache.containsKey(it.id) }
+
+        for (st in toFetch) {
+            val times = try {
+                sendPost(st.id)    // this will now time out after 2 s
+            } catch (e: Exception) {
+                NotificationHelper.createAndShowNotification(
+                    applicationContext,
+                    "Error: ${e.message}"
+                )
+                return
+            }
+            departureCache[st.id] = times
+        }
+
+        // Build the HTML from cache and display
+        val sb = StringBuilder()
+        stations.forEachIndexed { idx, st ->
+            val times = departureCache[st.id] ?: ""
+            sb.append("<u>${st.name}</u>: $times")
+            if (idx < stations.lastIndex) sb.append(" ")
+        }
+
+        NotificationHelper.createAndShowNotification(
+            applicationContext,
+            sb.toString()
+        )
     }
 
-    private fun createNotification(context: Context, content: String): Notification {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+}
+
+object NotificationHelper {
+
+    fun createNotification(context: Context, content: String): Notification {
         val spannedText = Html.fromHtml(content, Html.FROM_HTML_MODE_COMPACT)
         // Intent to handle notification click
         val intent = Intent(context, NotificationReceiver::class.java).apply {
@@ -650,13 +727,19 @@ class ForegroundService : Service() {
         expandedView.setOnClickPendingIntent(R.id.notificationTitleExpanded, pendingIntent)
 
         return NotificationCompat.Builder(context, CHANNEL_ID)
-            .setAutoCancel(true)
+            .setAutoCancel(false)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setOngoing(true) // Makes it permanent
             .setCustomContentView(collapsedView)
             .setCustomBigContentView(expandedView)
             .build()
+    }
+
+    fun createAndShowNotification(context: Context, content: String){
+        val notification = createNotification(context, content)
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(1, notification)
     }
 
 }
